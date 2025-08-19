@@ -1,3 +1,7 @@
+# Custom ignore
+data_cache.db
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
