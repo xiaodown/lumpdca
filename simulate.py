@@ -1,54 +1,108 @@
 import sys
 import time
 import random
-import threading
 import os
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from data import HistoricalData, clear_cache
 import pandas as pd
 import settings
 
 TRADE_FEE = settings.TRADE_FEE
 
-class ThreadSafeOutputManager:
-    """Thread-safe output manager with progress bar and scrolling results."""
+# Per-process worker cache: stores pre-processed ticker data as plain Python
+# structures so simulations never touch pandas after the first load.
+# Format: {ticker: {"dates": [...], "closes": [...], "monthly": [(year, month, close), ...]}}
+_worker_cache = {}
+
+
+def _worker_init():
+    """Initialize worker process with an empty data cache."""
+    global _worker_cache
+    _worker_cache = {}
+
+
+def _preprocess_ticker(ticker):
+    """Load ticker from SQLite via HistoricalData and pre-process into plain Python.
+    
+    Returns (processed_dict, was_download) where processed_dict has:
+      - 'closes': list of (date_ordinal, close_price) sorted by date
+      - 'monthly': dict of (year, month) -> first close price that month
+    """
+    hd = HistoricalData(ticker)
+    # Get full date range - we'll filter per-simulation with bisect
+    data = hd.get_data("1990-01-01", datetime.today().strftime("%Y-%m-%d"))
+    was_download = hd.was_cache_miss()
+    
+    if data is None or data.empty or 'Close' not in data.columns:
+        return None, was_download
+    
+    # Convert to sorted list of (date_ordinal, close_price)
+    closes = []
+    monthly = {}  # (year, month) -> first close price
+    
+    for dt, row in zip(data.index, data['Close'].values):
+        price = float(row)
+        ordinal = dt.toordinal() if hasattr(dt, 'toordinal') else pd.Timestamp(dt).toordinal()
+        closes.append((ordinal, price))
+        key = (dt.year, dt.month)
+        if key not in monthly:
+            monthly[key] = price
+    
+    return {'closes': closes, 'monthly': monthly}, was_download
+
+
+def _get_worker_data(ticker):
+    """Get pre-processed stock data with per-process caching."""
+    global _worker_cache
+    if ticker in _worker_cache:
+        return _worker_cache[ticker], False
+    processed, was_download = _preprocess_ticker(ticker)
+    _worker_cache[ticker] = processed
+    return processed, was_download
+
+class OutputManager:
+    """Output manager with progress bar and scrolling results."""
     
     def __init__(self, max_lines=8):
         self.max_lines = max_lines
         self.recent_results = []
         self.completed_count = 0
         self.total_count = 0
-        self.cache_downloads = set()  # Use set to avoid duplicates
-        self.lock = threading.Lock()
+        self.cache_downloads = set()
         self.last_display_lines = 0
+        self._last_display_time = 0
+        self._display_interval = 0.05  # seconds between display refreshes
         
-    def print_header(self, num_simulations, investment_amount, num_threads):
+    def print_header(self, num_simulations, investment_amount, num_workers):
         """Print static header information."""
         print("🚀 Investment Strategy Simulation")
         print(f"   Running {num_simulations:,} simulations with ${investment_amount:,} investment")
-        print(f"   Using {num_threads} threads on {os.cpu_count()} available cores")
+        print(f"   Using {num_workers} processes on {os.cpu_count()} available cores")
         print("   " + "="*60)
         print()
         self.total_count = num_simulations
         
     def add_cache_download(self, ticker):
         """Record a cache download."""
-        with self.lock:
-            self.cache_downloads.add(ticker)
-            self._update_display()
+        self.cache_downloads.add(ticker)
+        self._update_display()
     
-    def add_result(self, result_line):
-        """Add a completed simulation result."""
-        with self.lock:
-            self.completed_count += 1
+    def add_result(self, result_line=None):
+        """Record a completed simulation and optionally display a result line."""
+        self.completed_count += 1
+        if result_line:
             self.recent_results.append(result_line)
             if len(self.recent_results) > self.max_lines:
                 self.recent_results.pop(0)
+        # Throttle: only refresh display every _display_interval seconds
+        now = time.monotonic()
+        if now - self._last_display_time >= self._display_interval:
+            self._last_display_time = now
             self._update_display()
     
     def _update_display(self):
-        """Update the progress display - MUCH simpler approach."""
+        """Update the progress display."""
         # Clear previous output by moving cursor up
         if self.last_display_lines > 0:
             for _ in range(self.last_display_lines):
@@ -89,8 +143,8 @@ class ThreadSafeOutputManager:
     
     def finish(self):
         """Clean up display when done."""
-        with self.lock:
-            print("\n" * 2)
+        self._update_display()  # Final refresh to show 100%
+        print("\n" * 2)
 
 def pick_random_stock():
     """Pick a random stock from available stocks, respecting start years."""
@@ -132,197 +186,169 @@ def calculate_performance(lump, dca):
         percent_better = ((dca - lump) / lump) * 100 if lump > 0 else 0
         return "DCA", percent_better
 
-class ThreadSafeHistoricalData:
-    """Thread-safe wrapper for HistoricalData with download notification."""
+def run_single_simulation(sim_number, investment_amount):
+    """Run one complete simulation in a worker process.
     
-    _data_cache = {}  # Class-level cache to avoid duplicate HistoricalData objects
-    _cache_lock = threading.Lock()
-        
-    @classmethod
-    def get_cached_data(cls, ticker, start_date, end_date, output_manager=None):
-        """Get data with thread-safe caching and download notification."""
-        # Check if we already have this ticker's HistoricalData object in memory
-        with cls._cache_lock:
-            if ticker not in cls._data_cache:
-                cls._data_cache[ticker] = HistoricalData(ticker)
-            
-            historical_data = cls._data_cache[ticker]
-        
-        # Get the data (HistoricalData handles its own download locking)
-        data = historical_data.get_data(start_date, end_date)
-        
-        # Check if it was a cache miss and notify output manager
-        if historical_data.was_cache_miss() and output_manager:
-            output_manager.add_cache_download(ticker)
-        
-        return data
-
-class LumpSumStrategy:
-    """Thread-safe lump sum investing strategy."""
-    def __init__(self, ticker, start_date, investment):
-        self.ticker = ticker
-        self.start_date = start_date
-        self.investment = investment
-
-    def run(self, output_manager=None):
-        data = ThreadSafeHistoricalData.get_cached_data(
-            self.ticker, self.start_date, datetime.today().strftime("%Y-%m-%d"), output_manager
-        )
-        
-        # Clean error handling
-        if data is None or data.empty or 'Close' not in data.columns:
-            return None
-        
-        start_price = data.iloc[0]['Close']
-        end_price = data.iloc[-1]['Close']
-        
-        available = self.investment - TRADE_FEE
-        shares = int(available // start_price)
-        value_today = shares * end_price
-        
-        return value_today
-
-class DCAStrategy:
-    """Thread-safe dollar-cost averaging strategy."""
-    def __init__(self, ticker, start_date, years, investment):
-        self.ticker = ticker
-        self.start_date = start_date
-        self.years = years
-        self.investment = investment
-
-    def run(self, output_manager=None):
-        start_dt = datetime.strptime(self.start_date, "%Y-%m-%d")
-        today_dt = datetime.today()
-        available_months = (today_dt.year - start_dt.year) * 12 + (today_dt.month - start_dt.month)
-        dca_months = min(self.years * 12, available_months)
-        
-        if dca_months <= 0:
-            return 0
-        
-        monthly_contribution = self.investment / dca_months
-        data = ThreadSafeHistoricalData.get_cached_data(
-            self.ticker, self.start_date, today_dt.strftime("%Y-%m-%d"), output_manager
-        )
-        
-        # Clean error handling
-        if data is None or data.empty or 'Close' not in data.columns:
-            return None
-        
-        # Make a proper copy to avoid pandas warnings
-        data_copy = data.copy()
-        data_copy['year_month'] = data_copy.index.to_period('M')
-        monthly_data = data_copy.groupby('year_month').first()
-        
-        shares = 0
-        leftover = 0
-        months_processed = 0
-        
-        for period, row in monthly_data.iterrows():
-            if months_processed >= dca_months:
-                break
-            
-            price = row['Close']
-            available = monthly_contribution + leftover
-            
-            if available >= (price + TRADE_FEE):
-                available_for_shares = available - TRADE_FEE
-                buy_shares = int(available_for_shares // price)
-                cost_of_shares = buy_shares * price
-                leftover = available_for_shares - cost_of_shares
-                shares += buy_shares
-            else:
-                leftover = available
-            
-            months_processed += 1
-        
-        end_price = data_copy.iloc[-1]['Close']
-        value_today = shares * end_price
-        
-        return value_today
-
-def run_single_simulation(sim_number, investment_amount, output_manager):
-    """Run one simulation - thread-safe version."""
-    # Use thread-local random to avoid conflicts
-    local_random = random.Random()
-    local_random.seed()  # Let it auto-seed properly
+    Pure function: takes simple args, returns a result dict.
+    Uses pre-processed plain Python data — no pandas in the hot path.
+    """
+    ticker, name, stock_start_year = pick_random_stock()
+    start_date = pick_random_date_for_stock(stock_start_year)
+    years = pick_random_years()
     
-    # Temporarily replace random functions with thread-local versions
-    original_choice = random.choice
-    original_randint = random.randint
-    random.choice = local_random.choice
-    random.randint = local_random.randint
+    # Get pre-processed data (cached per-process for repeat tickers)
+    processed, was_download = _get_worker_data(ticker)
     
-    try:
-        ticker, name, stock_start_year = pick_random_stock()
-        start_date = pick_random_date_for_stock(stock_start_year)
-        years = pick_random_years()
-        
-        lump = LumpSumStrategy(ticker, start_date, investment_amount).run(output_manager)
-        dca = DCAStrategy(ticker, start_date, years, investment_amount).run(output_manager)
-        
-        winner, percent_better = calculate_performance(lump, dca)
-        
-        # Add result to output
-        if winner != "ERROR":
-            result_line = f"{ticker} from {start_date}: {winner} wins by {percent_better:5.1f}% ({format_currency(lump if winner == 'LUMP' else dca)})"
-            output_manager.add_result(result_line)
-        
+    if processed is None:
         return {
-            'sim_number': sim_number,
-            'ticker': ticker, 
-            'name': name,
-            'start_date': start_date, 
-            'lump': lump, 
-            'dca': dca, 
-            'years': years,
-            'winner': winner,
-            'percent_better': percent_better
+            'sim_number': sim_number, 'ticker': ticker, 'name': name,
+            'start_date': start_date, 'lump': None, 'dca': None,
+            'years': years, 'winner': 'ERROR', 'percent_better': 0,
+            'was_download': was_download,
         }
+    
+    closes = processed['closes']  # list of (ordinal, price), sorted by date
+    monthly = processed['monthly']  # dict of (year, month) -> first close price
+    
+    # Find the slice of closes within [start_date, today]
+    start_ord = datetime.strptime(start_date, "%Y-%m-%d").toordinal()
+    today_ord = datetime.today().toordinal()
+    
+    # Binary search for start index
+    lo, hi = 0, len(closes)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if closes[mid][0] < start_ord:
+            lo = mid + 1
+        else:
+            hi = mid
+    start_idx = lo
+    
+    # Binary search for end index (inclusive)
+    lo, hi = start_idx, len(closes)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if closes[mid][0] <= today_ord:
+            lo = mid + 1
+        else:
+            hi = mid
+    end_idx = lo - 1
+    
+    if start_idx > end_idx or start_idx >= len(closes):
+        return {
+            'sim_number': sim_number, 'ticker': ticker, 'name': name,
+            'start_date': start_date, 'lump': None, 'dca': None,
+            'years': years, 'winner': 'ERROR', 'percent_better': 0,
+            'was_download': was_download,
+        }
+    
+    start_price = closes[start_idx][1]
+    end_price = closes[end_idx][1]
+    
+    # --- Lump Sum (pure arithmetic) ---
+    available = investment_amount - TRADE_FEE
+    shares = int(available // start_price)
+    lump = shares * end_price
+    
+    # --- DCA (pure arithmetic on pre-computed monthly prices) ---
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    today_dt = datetime.today()
+    available_months = (today_dt.year - start_dt.year) * 12 + (today_dt.month - start_dt.month)
+    dca_months = min(years * 12, available_months)
+    
+    if dca_months <= 0:
+        dca = 0
+    else:
+        monthly_contribution = investment_amount / dca_months
+        shares = 0
+        leftover = 0.0
         
-    finally:
-        # Restore original random functions
-        random.choice = original_choice
-        random.randint = original_randint
+        year = start_dt.year
+        month = start_dt.month
+        
+        for _ in range(dca_months):
+            price = monthly.get((year, month))
+            if price is not None:
+                available = monthly_contribution + leftover
+                if available >= (price + TRADE_FEE):
+                    available_for_shares = available - TRADE_FEE
+                    buy_shares = int(available_for_shares // price)
+                    leftover = available_for_shares - buy_shares * price
+                    shares += buy_shares
+                else:
+                    leftover = available
+            
+            # Advance to next month
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        
+        dca = shares * end_price
+    
+    winner, percent_better = calculate_performance(lump, dca)
+    
+    return {
+        'sim_number': sim_number,
+        'ticker': ticker,
+        'name': name,
+        'start_date': start_date,
+        'lump': lump,
+        'dca': dca,
+        'years': years,
+        'winner': winner,
+        'percent_better': percent_better,
+        'was_download': was_download,
+    }
 
 def run_simulation(num_simulations, investment_amount, verbose=False):
-    """Run simulations in parallel with thread-safe output."""
+    """Run simulations in parallel using a process pool."""
     start_time = time.time()
 
-    # Calculate number of threads (CPU cores * 2, minimum 1)
-    num_threads = max(1, os.cpu_count() * 2)
-    num_threads = min(num_threads, num_simulations)  # Don't use more threads than simulations
+    num_workers = max(1, os.cpu_count())
+    num_workers = min(num_workers, num_simulations)
     
-    output_manager = ThreadSafeOutputManager()
-    output_manager.print_header(num_simulations, investment_amount, num_threads)
+    output_manager = OutputManager()
+    output_manager.print_header(num_simulations, investment_amount, num_workers)
     
     results = []
     
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        # Submit all simulations - PASS investment_amount to each simulation
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init) as executor:
         future_to_sim = {
-            executor.submit(run_single_simulation, i, investment_amount, output_manager): i 
+            executor.submit(run_single_simulation, i, investment_amount): i 
             for i in range(num_simulations)
         }
         
-        # Collect results as they complete
         for future in as_completed(future_to_sim):
             try:
                 result = future.result()
                 results.append(result)
+                
+                if result['was_download']:
+                    output_manager.add_cache_download(result['ticker'])
+                
+                if result['winner'] != "ERROR":
+                    winner = result['winner']
+                    result_line = (
+                        f"{result['ticker']} from {result['start_date']}: "
+                        f"{winner} wins by {result['percent_better']:5.1f}% "
+                        f"({format_currency(result['lump'] if winner == 'LUMP' else result['dca'])})"
+                    )
+                    output_manager.add_result(result_line)
+                else:
+                    output_manager.add_result()
+                    
             except Exception as exc:
                 sim_num = future_to_sim[future]
                 print(f'Simulation {sim_num} generated an exception: {exc}')
     
     output_manager.finish()
     
-    # Sort results by simulation number to maintain order
     results.sort(key=lambda x: x['sim_number'])
     
-    # Calculate elapsed time
     end_time = time.time()
     elapsed_time = end_time - start_time
     
-    # Store timing info in results for summary
     return results, elapsed_time
 
 def print_summary(results, investment_amount, elapsed_time):
@@ -447,7 +473,7 @@ def print_available_stocks():
 def print_help():
     """Prints usage information."""
     help_text = """
-Usage: ./simulate.py [num_simulations] [default_investment_amt] [-v|--verbose] [--clear-cache] [--update-cache] [--list-stocks]
+Usage: python simulate.py [num_simulations] [default_investment_amt] [-v|--verbose] [--clear-cache] [--update-cache] [--list-stocks]
 
 Arguments:
   num_simulations         Number of simulations to run (default: settings.NUM_SIMULATIONS)
