@@ -15,7 +15,9 @@ For a given flat amount of money:
 
 That constitutes one simulation.
 
-On a modern processor, you can expect it to take about 5ish minutes per 100,000 simulations.  It runs (2x num_cores) threads, so the more and faster cores your processor has the faster it'll run.
+On a modern processor, you can expect it to take about ~~5ish minutes per 100,000 simulations~~.  It runs (2x num_cores) threads, so the more and faster cores your processor has the faster it'll run.
+
+**Update:** I swapped from Threadpool to Processpool and got about a 10x speedup on Windows + WSL2 (vs. mac m1 hardware) due to GILs and process contention.  On an m1 mac it'll take ~5m for 100,000 simulations.  On my 9950x3d it's more like 22 sec now (used to be ~8min).
 
 ## Caveats
 
