@@ -72,7 +72,7 @@ class OutputManager:
         self.cache_downloads = set()
         self.last_display_lines = 0
         self._last_display_time = 0
-        self._display_interval = 0.05  # seconds between display refreshes
+        self._display_interval = 0.01  # seconds between display refreshes
         
     def print_header(self, num_simulations, investment_amount, num_workers):
         """Print static header information."""
@@ -185,6 +185,17 @@ def calculate_performance(lump, dca):
     else:
         percent_better = ((dca - lump) / lump) * 100 if lump > 0 else 0
         return "DCA", percent_better
+
+def _run_chunk(sim_start, chunk_size, investment_amount):
+    """Run a batch of simulations in one worker process.
+    
+    Processes chunk_size simulations and returns a list of result dicts.
+    One IPC round-trip per chunk instead of per simulation.
+    """
+    return [
+        run_single_simulation(sim_start + i, investment_amount)
+        for i in range(chunk_size)
+    ]
 
 def run_single_simulation(sim_number, investment_amount):
     """Run one complete simulation in a worker process.
@@ -302,11 +313,17 @@ def run_single_simulation(sim_number, investment_amount):
     }
 
 def run_simulation(num_simulations, investment_amount, verbose=False):
-    """Run simulations in parallel using a process pool."""
+    """Run simulations in parallel using a process pool with chunked batching."""
     start_time = time.time()
 
     num_workers = max(1, os.cpu_count())
     num_workers = min(num_workers, num_simulations)
+    
+    # Divide work into chunks — enough for smooth progress, few enough to minimize IPC
+    num_chunks = num_workers * 8
+    num_chunks = min(num_chunks, num_simulations)
+    base_chunk_size = num_simulations // num_chunks
+    remainder = num_simulations % num_chunks
     
     output_manager = OutputManager()
     output_manager.print_header(num_simulations, investment_amount, num_workers)
@@ -314,33 +331,35 @@ def run_simulation(num_simulations, investment_amount, verbose=False):
     results = []
     
     with ProcessPoolExecutor(max_workers=num_workers, initializer=_worker_init) as executor:
-        future_to_sim = {
-            executor.submit(run_single_simulation, i, investment_amount): i 
-            for i in range(num_simulations)
-        }
+        futures = []
+        sim_offset = 0
+        for i in range(num_chunks):
+            chunk_size = base_chunk_size + (1 if i < remainder else 0)
+            futures.append(executor.submit(_run_chunk, sim_offset, chunk_size, investment_amount))
+            sim_offset += chunk_size
         
-        for future in as_completed(future_to_sim):
+        for future in as_completed(futures):
             try:
-                result = future.result()
-                results.append(result)
-                
-                if result['was_download']:
-                    output_manager.add_cache_download(result['ticker'])
-                
-                if result['winner'] != "ERROR":
-                    winner = result['winner']
-                    result_line = (
-                        f"{result['ticker']} from {result['start_date']}: "
-                        f"{winner} wins by {result['percent_better']:5.1f}% "
-                        f"({format_currency(result['lump'] if winner == 'LUMP' else result['dca'])})"
-                    )
-                    output_manager.add_result(result_line)
-                else:
-                    output_manager.add_result()
+                chunk_results = future.result()
+                for result in chunk_results:
+                    results.append(result)
+                    
+                    if result['was_download']:
+                        output_manager.add_cache_download(result['ticker'])
+                    
+                    if result['winner'] != "ERROR":
+                        winner = result['winner']
+                        result_line = (
+                            f"{result['ticker']} from {result['start_date']}: "
+                            f"{winner} wins by {result['percent_better']:5.1f}% "
+                            f"({format_currency(result['lump'] if winner == 'LUMP' else result['dca'])})"
+                        )
+                        output_manager.add_result(result_line)
+                    else:
+                        output_manager.add_result()
                     
             except Exception as exc:
-                sim_num = future_to_sim[future]
-                print(f'Simulation {sim_num} generated an exception: {exc}')
+                print(f'Chunk generated an exception: {exc}')
     
     output_manager.finish()
     
