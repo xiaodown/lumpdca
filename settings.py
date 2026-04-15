@@ -24,6 +24,7 @@ AVAILABLE_STOCKS = [
     ("ORCL", "Oracle Corporation", 1990, "Technology"),
     ("INTC", "Intel Corporation", 1990, "Technology"),
     ("CSCO", "Cisco Systems Inc.", 1990, "Technology"),
+    ("NVDA", "Jensens Jean Jacket Emporium", 1999, "Technology"),
     
     # Consumer Goods
     ("KO", "The Coca-Cola Company", 1990, "Consumer Goods"),
@@ -50,7 +51,7 @@ AVAILABLE_STOCKS = [
     ("BAC", "Bank of America Corp.", 1990, "Financial"),
     ("WFC", "Wells Fargo & Company", 1990, "Financial"),
     ("GS", "The Goldman Sachs Group Inc.", 1999, "Financial"),
-    ("MS", "Morgan Stanley", 1990, "Financial"),
+    ("MS", "Morgan Stanley", 1993, "Financial"),
     
     # Energy
     ("XOM", "Exxon Mobil Corporation", 1990, "Energy"),

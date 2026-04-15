@@ -268,7 +268,7 @@ def run_single_simulation(sim_number, investment_amount):
     dca_months = min(years * 12, available_months)
     
     if dca_months <= 0:
-        dca = 0
+        dca = investment_amount
     else:
         monthly_contribution = investment_amount / dca_months
         shares = 0
@@ -278,9 +278,9 @@ def run_single_simulation(sim_number, investment_amount):
         month = start_dt.month
         
         for _ in range(dca_months):
+            available = monthly_contribution + leftover
             price = monthly.get((year, month))
             if price is not None:
-                available = monthly_contribution + leftover
                 if available >= (price + TRADE_FEE):
                     available_for_shares = available - TRADE_FEE
                     buy_shares = int(available_for_shares // price)
@@ -288,6 +288,8 @@ def run_single_simulation(sim_number, investment_amount):
                     shares += buy_shares
                 else:
                     leftover = available
+            else:
+                leftover = available
             
             # Advance to next month
             month += 1
@@ -295,7 +297,7 @@ def run_single_simulation(sim_number, investment_amount):
                 month = 1
                 year += 1
         
-        dca = shares * end_price
+        dca = shares * end_price + leftover
     
     winner, percent_better = calculate_performance(lump, dca)
     
@@ -418,9 +420,9 @@ def print_summary(results, investment_amount, elapsed_time):
     
     # Show best and worst performers
     best_lump = max(valid_results, key=lambda x: x['lump'] if x['lump'] else 0)
-    best_dca = max(valid_results, key=lambda x: x['dca'] if x['dca'] else 0)
+    best_dca = max(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else 0)
     worst_lump = min(valid_results, key=lambda x: x['lump'] if x['lump'] else float('inf'))
-    worst_dca = min(valid_results, key=lambda x: x['dca'] if x['dca'] else float('inf'))
+    worst_dca = min(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else float('inf'))
     
     print(f"\n🏆 Best Performers:")
     print(f"Lump Sum: {best_lump['ticker']} {format_currency(best_lump['lump'])} (from {best_lump['start_date']})")
