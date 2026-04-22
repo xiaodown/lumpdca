@@ -2,6 +2,7 @@ import sys
 import time
 import random
 import os
+import statistics
 from datetime import datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from data import HistoricalData, clear_cache
@@ -60,6 +61,29 @@ def _get_worker_data(ticker):
     processed, was_download = _preprocess_ticker(ticker)
     _worker_cache[ticker] = processed
     return processed, was_download
+
+
+def get_stock_lookup():
+    """Return configured stocks keyed by ticker."""
+    return {
+        ticker.upper(): (ticker, name, start_year, sector)
+        for ticker, name, start_year, sector in settings.AVAILABLE_STOCKS
+    }
+
+
+def resolve_ticker_pool(selected_tickers=None):
+    """Resolve an optional ticker subset against configured stocks."""
+    stock_lookup = get_stock_lookup()
+    if not selected_tickers:
+        return list(settings.AVAILABLE_STOCKS)
+
+    ticker_pool = []
+    for ticker in selected_tickers:
+        upper_ticker = ticker.upper()
+        if upper_ticker not in stock_lookup:
+            raise ValueError(f"Unknown ticker '{ticker}'. Use --list-stocks to see valid choices.")
+        ticker_pool.append(stock_lookup[upper_ticker])
+    return ticker_pool
 
 class OutputManager:
     """Output manager with progress bar and scrolling results."""
@@ -148,12 +172,19 @@ class OutputManager:
 
 def pick_random_stock():
     """Pick a random stock from available stocks, respecting start years."""
+    return pick_random_stock_from_pool(settings.AVAILABLE_STOCKS)
+
+
+def pick_random_stock_from_pool(stock_pool):
+    """Pick a random stock from a provided pool, respecting start years."""
     current_year = datetime.now().year
     available_now = [
         (ticker, name, start_year) for ticker, name, start_year, sector 
-        in settings.AVAILABLE_STOCKS 
+        in stock_pool
         if start_year <= current_year - 5  # At least 5 years of data
     ]
+    if not available_now:
+        raise ValueError("No stocks in the selected pool have at least 5 years of data.")
     ticker, name, start_year = random.choice(available_now)
     return ticker, name, start_year
 
@@ -186,26 +217,28 @@ def calculate_performance(lump, dca):
         percent_better = ((dca - lump) / lump) * 100 if lump > 0 else 0
         return "DCA", percent_better
 
-def _run_chunk(sim_start, chunk_size, investment_amount):
+def _run_chunk(sim_start, chunk_size, investment_amount, stock_pool, lump_only):
     """Run a batch of simulations in one worker process.
     
     Processes chunk_size simulations and returns a list of result dicts.
     One IPC round-trip per chunk instead of per simulation.
     """
     return [
-        run_single_simulation(sim_start + i, investment_amount)
+        run_single_simulation(sim_start + i, investment_amount, stock_pool, lump_only)
         for i in range(chunk_size)
     ]
 
-def run_single_simulation(sim_number, investment_amount):
+def run_single_simulation(sim_number, investment_amount, stock_pool=None, lump_only=False):
     """Run one complete simulation in a worker process.
     
     Pure function: takes simple args, returns a result dict.
     Uses pre-processed plain Python data — no pandas in the hot path.
     """
-    ticker, name, stock_start_year = pick_random_stock()
+    if stock_pool is None:
+        stock_pool = settings.AVAILABLE_STOCKS
+    ticker, name, stock_start_year = pick_random_stock_from_pool(stock_pool)
     start_date = pick_random_date_for_stock(stock_start_year)
-    years = pick_random_years()
+    years = None if lump_only else pick_random_years()
     
     # Get pre-processed data (cached per-process for repeat tickers)
     processed, was_download = _get_worker_data(ticker)
@@ -261,45 +294,50 @@ def run_single_simulation(sim_number, investment_amount):
     shares = int(available // start_price)
     lump = shares * end_price
     
-    # --- DCA (pure arithmetic on pre-computed monthly prices) ---
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    today_dt = datetime.today()
-    available_months = (today_dt.year - start_dt.year) * 12 + (today_dt.month - start_dt.month)
-    dca_months = min(years * 12, available_months)
-    
-    if dca_months <= 0:
-        dca = investment_amount
+    if lump_only:
+        dca = None
+        winner = "LUMP_ONLY"
+        percent_better = 0
     else:
-        monthly_contribution = investment_amount / dca_months
-        shares = 0
-        leftover = 0.0
+        # --- DCA (pure arithmetic on pre-computed monthly prices) ---
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        today_dt = datetime.today()
+        available_months = (today_dt.year - start_dt.year) * 12 + (today_dt.month - start_dt.month)
+        dca_months = min(years * 12, available_months)
         
-        year = start_dt.year
-        month = start_dt.month
-        
-        for _ in range(dca_months):
-            available = monthly_contribution + leftover
-            price = monthly.get((year, month))
-            if price is not None:
-                if available >= (price + TRADE_FEE):
-                    available_for_shares = available - TRADE_FEE
-                    buy_shares = int(available_for_shares // price)
-                    leftover = available_for_shares - buy_shares * price
-                    shares += buy_shares
+        if dca_months <= 0:
+            dca = investment_amount
+        else:
+            monthly_contribution = investment_amount / dca_months
+            shares = 0
+            leftover = 0.0
+            
+            year = start_dt.year
+            month = start_dt.month
+            
+            for _ in range(dca_months):
+                available = monthly_contribution + leftover
+                price = monthly.get((year, month))
+                if price is not None:
+                    if available >= (price + TRADE_FEE):
+                        available_for_shares = available - TRADE_FEE
+                        buy_shares = int(available_for_shares // price)
+                        leftover = available_for_shares - buy_shares * price
+                        shares += buy_shares
+                    else:
+                        leftover = available
                 else:
                     leftover = available
-            else:
-                leftover = available
+                
+                # Advance to next month
+                month += 1
+                if month > 12:
+                    month = 1
+                    year += 1
             
-            # Advance to next month
-            month += 1
-            if month > 12:
-                month = 1
-                year += 1
+            dca = shares * end_price + leftover
         
-        dca = shares * end_price + leftover
-    
-    winner, percent_better = calculate_performance(lump, dca)
+        winner, percent_better = calculate_performance(lump, dca)
     
     return {
         'sim_number': sim_number,
@@ -314,9 +352,10 @@ def run_single_simulation(sim_number, investment_amount):
         'was_download': was_download,
     }
 
-def run_simulation(num_simulations, investment_amount, verbose=False):
+def run_simulation(num_simulations, investment_amount, verbose=False, selected_tickers=None, lump_only=False):
     """Run simulations in parallel using a process pool with chunked batching."""
     start_time = time.time()
+    stock_pool = resolve_ticker_pool(selected_tickers)
 
     num_workers = max(1, os.cpu_count())
     num_workers = min(num_workers, num_simulations)
@@ -337,7 +376,7 @@ def run_simulation(num_simulations, investment_amount, verbose=False):
         sim_offset = 0
         for i in range(num_chunks):
             chunk_size = base_chunk_size + (1 if i < remainder else 0)
-            futures.append(executor.submit(_run_chunk, sim_offset, chunk_size, investment_amount))
+            futures.append(executor.submit(_run_chunk, sim_offset, chunk_size, investment_amount, stock_pool, lump_only))
             sim_offset += chunk_size
         
         for future in as_completed(futures):
@@ -350,12 +389,18 @@ def run_simulation(num_simulations, investment_amount, verbose=False):
                         output_manager.add_cache_download(result['ticker'])
                     
                     if result['winner'] != "ERROR":
-                        winner = result['winner']
-                        result_line = (
-                            f"{result['ticker']} from {result['start_date']}: "
-                            f"{winner} wins by {result['percent_better']:5.1f}% "
-                            f"({format_currency(result['lump'] if winner == 'LUMP' else result['dca'])})"
-                        )
+                        if lump_only:
+                            result_line = (
+                                f"{result['ticker']} from {result['start_date']}: "
+                                f"LUMP value {format_currency(result['lump'])}"
+                            )
+                        else:
+                            winner = result['winner']
+                            result_line = (
+                                f"{result['ticker']} from {result['start_date']}: "
+                                f"{winner} wins by {result['percent_better']:5.1f}% "
+                                f"({format_currency(result['lump'] if winner == 'LUMP' else result['dca'])})"
+                            )
                         output_manager.add_result(result_line)
                     else:
                         output_manager.add_result()
@@ -372,7 +417,45 @@ def run_simulation(num_simulations, investment_amount, verbose=False):
     
     return results, elapsed_time
 
-def print_summary(results, investment_amount, elapsed_time):
+def calculate_strategy_stats(values):
+    """Calculate aggregate stats for a list of portfolio values."""
+    if not values:
+        return None
+    return {
+        'avg': statistics.mean(values),
+        'median': statistics.median(values),
+        'min': min(values),
+        'max': max(values),
+    }
+
+
+def print_yearly_lump_summary(valid_results):
+    """Print lump-sum statistics grouped by simulation start year."""
+    yearly_values = {}
+    for result in valid_results:
+        start_year = result['start_date'][:4]
+        yearly_values.setdefault(start_year, []).append(result['lump'])
+
+    if not yearly_values:
+        return
+
+    print("\n📅 Lump Sum By Start Year:")
+    print(f"{'Year':<8} {'Count':<8} {'Median':<12} {'Average':<12} {'Min':<12} {'Max':<12}")
+    print("-" * 72)
+    for year in sorted(yearly_values):
+        values = yearly_values[year]
+        stats = calculate_strategy_stats(values)
+        print(
+            f"{year:<8} "
+            f"{len(values):<8} "
+            f"{format_currency(stats['median']):<12} "
+            f"{format_currency(stats['avg']):<12} "
+            f"{format_currency(stats['min']):<12} "
+            f"{format_currency(stats['max']):<12}"
+        )
+
+
+def print_summary(results, investment_amount, elapsed_time, lump_only=False, yearly=False, selected_tickers=None):
     """Print summary statistics."""
     valid_results = [r for r in results if r['winner'] != 'ERROR']
     
@@ -380,28 +463,9 @@ def print_summary(results, investment_amount, elapsed_time):
         print("❌ No valid results to summarize")
         return
     
-    lump_wins = len([r for r in valid_results if r['winner'] == 'LUMP'])
-    dca_wins = len([r for r in valid_results if r['winner'] == 'DCA'])
     total = len(valid_results)
-    
-    # Calculate statistics for both strategies
     lump_values = [r['lump'] for r in valid_results if r['lump'] is not None]
-    dca_values = [r['dca'] for r in valid_results if r['dca'] is not None]
-    
-    if lump_values and dca_values:
-        import statistics
-        
-        avg_lump = statistics.mean(lump_values)
-        avg_dca = statistics.mean(dca_values)
-        median_lump = statistics.median(lump_values)
-        median_dca = statistics.median(dca_values)
-        
-        # Show min/max for context
-        min_lump, max_lump = min(lump_values), max(lump_values)
-        min_dca, max_dca = min(dca_values), max(dca_values)
-    else:
-        avg_lump = avg_dca = median_lump = median_dca = 0
-        min_lump = max_lump = min_dca = max_dca = 0
+    lump_stats = calculate_strategy_stats(lump_values)
     
     print("="*60)
     print("📊 SIMULATION SUMMARY")
@@ -409,31 +473,59 @@ def print_summary(results, investment_amount, elapsed_time):
     print(f"Total Simulations: {total:,}")
     print(f"Starting Capital:  {format_currency(investment_amount)}")
     print(f"Time Elapsed:      {elapsed_time:.2f} seconds")
-    print(f"Lump Sum Wins:     {lump_wins:,} ({lump_wins/total*100:.1f}%)")
-    print(f"DCA Wins:          {dca_wins:,} ({dca_wins/total*100:.1f}%)")
+
+    if selected_tickers:
+        print(f"Ticker Filter:     {', '.join(selected_tickers)}")
+
+    print(f"Mode:              {'Lump Sum Only' if lump_only else 'Lump Sum vs DCA'}")
     
     print(f"\n📈 Returns Analysis:")
     print(f"{'Strategy':<12} {'Median':<12} {'Average':<12} {'Min':<12} {'Max':<12}")
     print("-" * 60)
-    print(f"{'Lump Sum':<12} {format_currency(median_lump):<12} {format_currency(avg_lump):<12} {format_currency(min_lump):<12} {format_currency(max_lump):<12}")
-    print(f"{'DCA':<12} {format_currency(median_dca):<12} {format_currency(avg_dca):<12} {format_currency(min_dca):<12} {format_currency(max_dca):<12}")
-    
-    # Show best and worst performers
-    best_lump = max(valid_results, key=lambda x: x['lump'] if x['lump'] else 0)
-    best_dca = max(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else 0)
-    worst_lump = min(valid_results, key=lambda x: x['lump'] if x['lump'] else float('inf'))
-    worst_dca = min(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else float('inf'))
-    
-    print(f"\n🏆 Best Performers:")
-    print(f"Lump Sum: {best_lump['ticker']} {format_currency(best_lump['lump'])} (from {best_lump['start_date']})")
-    print(f"DCA:      {best_dca['ticker']} {format_currency(best_dca['dca'])} (from {best_dca['start_date']})")
-    
-    print(f"\n📉 Worst Performers:")
-    print(f"Lump Sum: {worst_lump['ticker']} {format_currency(worst_lump['lump'])} (from {worst_lump['start_date']})")
-    print(f"DCA:      {worst_dca['ticker']} {format_currency(worst_dca['dca'])} (from {worst_dca['start_date']})")
-    
-    # Show some context about outliers
-    if max_lump > avg_lump * 3:
+    print(
+        f"{'Lump Sum':<12} "
+        f"{format_currency(lump_stats['median']):<12} "
+        f"{format_currency(lump_stats['avg']):<12} "
+        f"{format_currency(lump_stats['min']):<12} "
+        f"{format_currency(lump_stats['max']):<12}"
+    )
+
+    if lump_only:
+        best_lump = max(valid_results, key=lambda x: x['lump'] if x['lump'] else 0)
+        worst_lump = min(valid_results, key=lambda x: x['lump'] if x['lump'] else float('inf'))
+
+        print(f"\n🏆 Best Lump Sum:")
+        print(f"{best_lump['ticker']} {format_currency(best_lump['lump'])} (from {best_lump['start_date']})")
+
+        print(f"\n📉 Worst Lump Sum:")
+        print(f"{worst_lump['ticker']} {format_currency(worst_lump['lump'])} (from {worst_lump['start_date']})")
+    else:
+        lump_wins = len([r for r in valid_results if r['winner'] == 'LUMP'])
+        dca_wins = len([r for r in valid_results if r['winner'] == 'DCA'])
+        dca_values = [r['dca'] for r in valid_results if r['dca'] is not None]
+        dca_stats = calculate_strategy_stats(dca_values)
+
+        print(f"{'DCA':<12} {format_currency(dca_stats['median']):<12} {format_currency(dca_stats['avg']):<12} {format_currency(dca_stats['min']):<12} {format_currency(dca_stats['max']):<12}")
+        print(f"\nLump Sum Wins:     {lump_wins:,} ({lump_wins/total*100:.1f}%)")
+        print(f"DCA Wins:          {dca_wins:,} ({dca_wins/total*100:.1f}%)")
+
+        best_lump = max(valid_results, key=lambda x: x['lump'] if x['lump'] else 0)
+        best_dca = max(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else 0)
+        worst_lump = min(valid_results, key=lambda x: x['lump'] if x['lump'] else float('inf'))
+        worst_dca = min(valid_results, key=lambda x: x['dca'] if x['dca'] is not None else float('inf'))
+        
+        print(f"\n🏆 Best Performers:")
+        print(f"Lump Sum: {best_lump['ticker']} {format_currency(best_lump['lump'])} (from {best_lump['start_date']})")
+        print(f"DCA:      {best_dca['ticker']} {format_currency(best_dca['dca'])} (from {best_dca['start_date']})")
+        
+        print(f"\n📉 Worst Performers:")
+        print(f"Lump Sum: {worst_lump['ticker']} {format_currency(worst_lump['lump'])} (from {worst_lump['start_date']})")
+        print(f"DCA:      {worst_dca['ticker']} {format_currency(worst_dca['dca'])} (from {worst_dca['start_date']})")
+
+    if yearly:
+        print_yearly_lump_summary(valid_results)
+
+    if lump_stats['max'] > lump_stats['avg'] * 3:
         print(f"\n⚠️  Note: Large outliers detected. Median may be more representative than average.")
     
     print("="*60)
@@ -494,7 +586,7 @@ def print_available_stocks():
 def print_help():
     """Prints usage information."""
     help_text = """
-Usage: python simulate.py [num_simulations] [default_investment_amt] [-v|--verbose] [--clear-cache] [--update-cache] [--list-stocks]
+Usage: python simulate.py [num_simulations] [default_investment_amt] [-v|--verbose] [--clear-cache] [--update-cache] [--list-stocks] [--tickers T1,T2,...] [--lump-only] [--yearly]
 
 Arguments:
   num_simulations         Number of simulations to run (default: settings.NUM_SIMULATIONS)
@@ -505,6 +597,9 @@ Options:
   --clear-cache           Clear the cached historical data and exit
   --update-cache          Update the cache for all locally cached stocks
   --list-stocks           Show all available stocks for simulation and exit
+  --tickers               Comma-separated subset of tickers to simulate
+  --lump-only             Skip DCA and run only lump-sum simulations
+  --yearly                Show lump-sum stats grouped by start year (requires --lump-only)
 """
     print(help_text)
 
@@ -516,30 +611,60 @@ def parse_args():
     clear_cache_flag = False
     update_cache_flag = False
     list_stocks_flag = False
+    selected_tickers = None
+    lump_only = False
+    yearly = False
+    positional_args = []
 
-    args = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
-    flags = [arg for arg in sys.argv[1:] if arg.startswith('-')]
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ('-h', '--help'):
+            print_help()
+            sys.exit(0)
+        if arg in ('-v', '--verbose'):
+            verbose = True
+        elif arg == '--clear-cache':
+            clear_cache_flag = True
+        elif arg == '--update-cache':
+            update_cache_flag = True
+        elif arg == '--list-stocks':
+            list_stocks_flag = True
+        elif arg == '--lump-only':
+            lump_only = True
+        elif arg == '--yearly':
+            yearly = True
+        elif arg == '--tickers':
+            if i + 1 >= len(argv):
+                print("Error: --tickers requires a comma-separated value, e.g. --tickers SPY,QQQ,VTI")
+                sys.exit(1)
+            tickers_arg = argv[i + 1]
+            selected_tickers = [ticker.strip().upper() for ticker in tickers_arg.split(',') if ticker.strip()]
+            if not selected_tickers:
+                print("Error: --tickers requires at least one ticker.")
+                sys.exit(1)
+            i += 1
+        elif arg.startswith('-'):
+            print(f"Error: Unknown option '{arg}'")
+            print_help()
+            sys.exit(1)
+        else:
+            positional_args.append(arg)
+        i += 1
 
-    if '-h' in flags or '--help' in flags:
-        print_help()
-        sys.exit(0)
-    if '-v' in flags or '--verbose' in flags:
-        verbose = True
-    if '--clear-cache' in flags:
-        clear_cache_flag = True
-    if '--update-cache' in flags:
-        update_cache_flag = True
-    if '--list-stocks' in flags:
-        list_stocks_flag = True
+    if yearly and not lump_only:
+        print("Error: --yearly requires --lump-only.")
+        sys.exit(1)
 
-    if len(args) > 0:
+    if len(positional_args) > 0:
         try:
-            num_simulations = int(args[0])
+            num_simulations = int(positional_args[0])
         except ValueError:
-            print(f"Warning: Could not parse number of simulations '{args[0]}', using default {settings.NUM_SIMULATIONS}")
+            print(f"Warning: Could not parse number of simulations '{positional_args[0]}', using default {settings.NUM_SIMULATIONS}")
 
-    if len(args) > 1:
-        original_arg = args[1]
+    if len(positional_args) > 1:
+        original_arg = positional_args[1]
         amt_str = original_arg.replace('$', '').replace(',', '').strip()
         
         try:
@@ -551,10 +676,30 @@ def parse_args():
             print(f"Warning: Could not parse investment amount '{original_arg}': {e}")
             print(f"Using default ${settings.DEFAULT_INVESTMENT}")
 
-    return num_simulations, default_investment, verbose, clear_cache_flag, update_cache_flag, list_stocks_flag
+    return (
+        num_simulations,
+        default_investment,
+        verbose,
+        clear_cache_flag,
+        update_cache_flag,
+        list_stocks_flag,
+        selected_tickers,
+        lump_only,
+        yearly,
+    )
 
 if __name__ == "__main__":
-    num_simulations, default_investment, verbose, clear_cache_flag, update_cache_flag, list_stocks_flag = parse_args()
+    (
+        num_simulations,
+        default_investment,
+        verbose,
+        clear_cache_flag,
+        update_cache_flag,
+        list_stocks_flag,
+        selected_tickers,
+        lump_only,
+        yearly,
+    ) = parse_args()
     
     if clear_cache_flag:
         clear_cache()
@@ -567,5 +712,23 @@ if __name__ == "__main__":
         sys.exit(0)
     
     # Pass investment_amount explicitly to avoid global variable issues
-    results, elapsed_time = run_simulation(num_simulations, default_investment, verbose)
-    print_summary(results, default_investment, elapsed_time)
+    try:
+        results, elapsed_time = run_simulation(
+            num_simulations,
+            default_investment,
+            verbose,
+            selected_tickers=selected_tickers,
+            lump_only=lump_only,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+
+    print_summary(
+        results,
+        default_investment,
+        elapsed_time,
+        lump_only=lump_only,
+        yearly=yearly,
+        selected_tickers=selected_tickers,
+    )

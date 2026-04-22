@@ -54,6 +54,14 @@ To run a simulation, with your venv active:
 ```
 python simulate.py <num_of_simulations> <starting_capital>
 ```
+To restrict simulations to a subset of tickers:
+```
+python simulate.py 100000 10000 --tickers SPY,QQQ,VTI
+```
+To run lump-sum-only simulations and print results grouped by start year:
+```
+python simulate.py 100000 10000 --tickers SPY,QQQ,VTI --lump-only --yearly
+```
 If you want to force it to update its stock list with more up-to-date data:
 ```
 python simulate.py --update-cache
