@@ -7,11 +7,8 @@ Capable of running 1,000,000 simulations in under 5 seconds (on my Ryzen 9 9950X
 
 ## Demo
 
-<div align="center">
-<table>
-<tr>
-<td>
-<pre>(lumpdca) xiaodown@rocinante:~/code/lumpdca$ python simulate.py 1000000 50000
+```text
+(lumpdca) xiaodown@rocinante:~/code/lumpdca$ python simulate.py 1000000 50000
 🚀 Investment Strategy Simulation
    Running 1,000,000 simulations with $50,000 investment
    Using 32 processes on 32 available cores
@@ -56,11 +53,8 @@ Lump Sum: NKE $15,808 (from 2020-12-20)
 DCA:      NKE $16,543 (from 2020-09-02)
 
 ⚠️  Note: Large outliers detected. Median may be more representative than average.
-============================================================</pre>
-</td>
-</tr>
-</table>
-</div>
+============================================================
+```
 
 ## What a simulation is
 
