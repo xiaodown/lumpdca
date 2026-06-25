@@ -3,6 +3,65 @@ A simulator for DCA vs Lump sum stock investing.
 
 Tells you what percentage of the time it would have been better to dollar cost average vs. buying stocks in one lump purchase, based on historical data.
 
+Capable of running 1,000,000 simulations in under 5 seconds (on my Ryzen 9 9950X3D)
+
+## Demo
+
+<div align="center">
+<table>
+<tr>
+<td>
+<pre>(lumpdca) xiaodown@rocinante:~/code/lumpdca$ python simulate.py 1000000 50000
+🚀 Investment Strategy Simulation
+   Running 1,000,000 simulations with $50,000 investment
+   Using 32 processes on 32 available cores
+   ============================================================
+
+[████████████████████████████████████████] 1,000,000/1,000,000 (100.0%)
+META from 2018-07-05: DCA wins by  10.7% ($156,825)
+T from 2015-04-18: LUMP wins by  30.2% ($97,399)
+IWM from 2013-01-19: LUMP wins by  20.6% ($197,892)
+MSFT from 1998-03-13: LUMP wins by  54.5% ($1,458,185)
+COP from 2001-02-11: LUMP wins by  76.7% ($560,582)
+IBM from 2000-11-16: LUMP wins by   5.8% ($272,427)
+CMCSA from 2009-01-03: LUMP wins by 119.2% ($208,492)
+BAC from 1996-04-19: LUMP wins by  56.8% ($325,424)
+
+
+
+
+============================================================
+📊 SIMULATION SUMMARY
+============================================================
+Total Simulations: 1,000,000
+Starting Capital:  $50,000
+Time Elapsed:      4.23 seconds
+Mode:              Lump Sum vs DCA
+
+📈 Returns Analysis:
+Strategy     Median       Average      Min          Max
+------------------------------------------------------------
+Lump Sum     $355,631     $2,126,143   $15,808      $318,377,314
+DCA          $275,412     $1,299,593   $16,543      $154,518,127
+
+Lump Sum Wins:     836,253 (83.6%)
+DCA Wins:          163,747 (16.4%)
+
+🏆 Best Performers:
+Lump Sum: NVDA $318,377,314 (from 1999-06-18)
+DCA:      NVDA $154,518,127 (from 1999-01-02)
+
+📉 Worst Performers:
+Lump Sum: NKE $15,808 (from 2020-12-20)
+DCA:      NKE $16,543 (from 2020-09-02)
+
+⚠️  Note: Large outliers detected. Median may be more representative than average.
+============================================================</pre>
+</td>
+</tr>
+</table>
+</div>
+
 ## What a simulation is
 
 For a given flat amount of money:
