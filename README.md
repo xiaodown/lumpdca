@@ -83,7 +83,7 @@ Caveats include:
  * This /should/ account for splits (prices in yfinance are split-adjusted).
  * This does not account for dividends. However, since it's a comparison of DCAing one stock vs. buying a lump sum of the same stock, reinvesting the dividends would mostly equal out in the wash, with a bias towards lump sum.
  * The list of stocks was mostly just chosen by me - it's a bunch of blue chips plus a bunch of zeitgeist regular suspects. It may not be representative.
- * This was built for speed, not accuracy, and shouldn't be taken as anything useful for actual investing advice. Also the code is pretty sloppy.
+ * This was built for speed, not accuracy, and shouldn't be taken as anything useful for actual investing advice.
  * People probably don't DCA into the same company for 10 years. I know that. It was just useful for the simulation.
  * I don't know anything about investment software outside of the etrade app on my phone. There are probably very large, very accurate, very expensive software suits that exist out there for doing exactly this. There's no way this is novel.
  * This was done more for the learning experience with the available python libraries than for the investment advice (such as it is).
